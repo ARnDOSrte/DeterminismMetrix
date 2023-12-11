@@ -445,6 +445,156 @@ def ChangeHRGroupConsoCostsByEpsilon(test_folder:str, dicoVariants:dict,dataJSON
 
     return dicoVariants
 
+def ChangeARGroupConsoCostsByEpsilon(test_folder:str, dicoVariants:dict,dataJSON:dict):
+    """Subtracts an epsilon to the AR cost of the groups, so as to favor the groups that are used in the redispatching phase of the solution,
+    with priority to the groups that used to their maximum capacity, and then to the ones with the biggest power modification.
+    Does the same with the consumption. Also we reduce by an epsilon the threshold of all lines appearing in the R4 section
+    @Param test_folder : address of the folder containing the out files, the VariantSet.csv and fort.json
+    @Param dicoVariants : dict containing all the data of the VariantSet.csv
+    @Param dataJSON : dict containing all the data of the fort.json
+    @Return dicoVariants : modified dict in which the HR costs of the groups are modified by an epsilon"""
+    
+    if test_folder[-1] == "/":
+        end_line = ""
+    else:
+        end_line = "/"
+
+    usedGroups = {'COUHAR' :{}, 'COUBAR' :{}} # Stores the groups whose costs were redefined using epsilon in former variants
+    # Each dictionnary will contain name of the group -> Initial cost
+
+    for variant_number in dicoVariants:
+    # for variant_number in range(-1,7):
+        print('Traitement AR préventif : Variante ',variant_number)
+        #We import the VariantSet.csv and check that it has any redispatching going on
+        variant_address = test_folder + end_line + "out_s" + str(variant_number)
+        if not os.path.exists(variant_address):
+            continue
+
+        #We check that the simulation worked correctly and has info to show
+        df_variant_C1 = read_RX(variant_address, "C1")
+        if not df_variant_C1.empty:
+            if df_variant_C1["CODE"][0] != "0":
+                print("Le fichier de la variante ",variant_number," est vide. On passe aux variantes suivantes.")
+                continue
+
+        df_variantR2 = read_RX(variant_address, "R2")
+        
+        # We store the R2 section of the out file ot his variant.
+        # We keep only the ligns that present a non-null adequacy phase.
+        if not df_variantR2.empty:
+            df_variantR2 = df_variantR2[df_variantR2["DELTA_P_AR"] != '']
+
+        df_variantR1 = read_RX(variant_address, "R1")
+        if not df_variantR1.empty:
+            df_variantR1 = df_variantR1[df_variantR1['DF AR'] != '']
+
+        used_groups_COUHAR = [] #stores the name of the groups who were used to increase production in this variant
+        used_groups_COUBAR = [] #stores the name of the groups who were used to decrease production in this variant
+        typeOfGroup = {'COUHAR' : used_groups_COUHAR, 'COUBAR' : used_groups_COUBAR}
+
+        # We list the groups that are used in this variant : they will be 
+        # favored by decreasing their cost of an epsilon
+        if not df_variantR2.empty:
+            for idx in df_variantR2.index:
+                group = df_variantR2['GROUPE'][idx]
+                #We check if the current group has its power pushed to Pmin or Pmax.
+                #To do that, as the production displayed in the out files is precise to
+                #0.1, we compare it to that instead of 0
+                if Decimal(df_variantR2['DELTA_P_AR'][idx]) > 0.0:
+                    #If the group is used to increase production
+                    maxedProd = (abs(Decimal(df_variantR2['PDISPO'][idx]) - Decimal(df_variantR2['DELTA_PIMP'][idx]) - Decimal(df_variantR2['DELTA_P_AR'][idx])) <= Decimal(rate_of_selection))
+                    used_groups_COUHAR.append((group, Decimal(df_variantR2['DELTA_P_AR'][idx]), maxedProd))
+                    if group not in usedGroups['COUHAR']:
+                        (cost, numVariant) = getGroupCost(dicoVariants, group, variant_number, "COUHAR")
+                        if numVariant == -1 or numVariant == UndefinedValue:
+                            usedGroups['COUHAR'][group] = cost
+
+                else:
+                    #We have to find the minimum production of the group. As it is not displayed in the 
+                    #output file, we have to look for it in the JSON file
+                    prodMin = extractDataJSON.getGroupProdMinAR(group,variant_number,dataJSON,dicoVariants)
+                    maxedProd = (abs(Decimal(df_variantR2['DELTA_PIMP'][idx]) + Decimal(df_variantR2['DELTA_P_AR'][idx]) - prodMin) <= Decimal(rate_of_selection))
+                    used_groups_COUBAR.append((group, abs(Decimal(df_variantR2['DELTA_P_AR'][idx])), maxedProd))
+                    if group not in usedGroups['COUBAR']:
+                        (cost, numVariant) = getGroupCost(dicoVariants, group, variant_number, "COUBAR")
+                        if numVariant == -1 or numVariant == UndefinedValue:
+                            usedGroups['COUBAR'][group] = cost
+        
+        if not df_variantR1.empty:
+            for idx in df_variantR1.index:
+                conso = df_variantR1['CONSO'][idx]
+                currentConso = Decimal(df_variantR1['VALEUR'][idx])
+                changedConso = Decimal(df_variantR1['DF AR'][idx])
+                erasedConso = (abs(changedConso - currentConso) <= Decimal(rate_of_selection))
+                used_groups_COUBAR.append((conso, changedConso, erasedConso))
+        
+        # We sort the values by increasing production or consumption and by whether
+        # the group reached its Pmin or Pmax.
+        used_groups_COUHAR.sort(key=lambda item: (item[2],item[1]))
+        used_groups_COUBAR.sort(key=lambda item: (item[2],item[1]))
+
+        for typeOfElement in typeOfGroup:
+            #We substract added_cost to the existing cost of the groups ; added_cost's value increments
+            #if the groups have a different power, we add epsilon to added_cost.
+            #If the original cost of a group is negative, we change it to 0,
+            #and then aply the epsilonesque modification
+            added_cost = Decimal(0.0)
+            former_power = 0.0
+            #We add the noise cost to the conso ; it cannot be found in any file, 
+            #it is embedded in the Metrix code
+            
+            for (used_group,power, bool) in typeOfGroup[typeOfElement]:
+                if used_group in df_variantR1['CONSO'].values:
+                    typeOfCost = "COUEFFAR"
+                    existing_cost = extractDataJSON.getMinCostDelestageConsoAR(used_group,variant_number,dataJSON,dicoVariants)
+                else:
+                    typeOfCost = typeOfElement
+                    existing_cost = Decimal(0.0)
+                if former_power != power:
+                    added_cost += epsilon
+                    former_power = power
+
+                if (-1 in dicoVariants and typeOfCost in dicoVariants[-1] 
+                    and used_group in dicoVariants[-1][typeOfCost] and 
+                    dicoVariants[-1][typeOfCost][used_group] >= 0.0
+                    and typeOfCost != "COUEFFAR"):
+                    existing_cost = dicoVariants[-1][typeOfCost][used_group]
+                
+                if variant_number not in dicoVariants:
+                    dicoVariants[variant_number] = {typeOfCost:{used_group : Decimal("{:.{}f}".format(existing_cost - added_cost,precision))}}
+                elif typeOfCost not in dicoVariants[variant_number]:
+                    dicoVariants[variant_number][typeOfCost] = {used_group : Decimal("{:.{}f}".format(existing_cost - added_cost,precision))}
+                elif used_group not in dicoVariants[variant_number][typeOfCost]:
+                    dicoVariants[variant_number][typeOfCost][used_group] = Decimal("{:.{}f}".format(existing_cost - added_cost,precision))
+                else:
+                    if dicoVariants[variant_number][typeOfCost][used_group] >= 0.0:
+                        dicoVariants[variant_number][typeOfCost][used_group] -= Decimal("{:.{}f}".format(added_cost,precision))
+                    else:
+                        #We don't add additionnal cost here because having a consumption area paying to stop consuming is illogical
+                        #And will make the study bug
+                        dicoVariants[variant_number][typeOfCost][used_group] = -Decimal("{:.{}f}".format(added_cost,precision))
+        
+        # We redefine the costs of the groups that were used before but not in this variant
+
+        # If some groups were used to increase (or decrease) production in former variants, we have to
+        # redefine their costs in the next variant. Unless this next variant doesn't need
+        # to increase (or decrease) production : then we don't redefine the costs of those groups used before.
+        # That is what we check here.
+    for typeOfCost in usedGroups:
+        for group in usedGroups[typeOfCost]:
+            #If a group has a cost in this list, then its cost isn't defined in every variant : we have to 
+            #put the original cost in every variant that we haven't modified
+            for variant_number in dicoVariants:
+                if variant_number == -1 : continue
+                if typeOfCost not in dicoVariants[variant_number]:
+                    dicoVariants[variant_number][typeOfCost] = {group : usedGroups[typeOfCost][group]}
+                elif group not in dicoVariants[variant_number][typeOfCost]:
+                    dicoVariants[variant_number][typeOfCost][group] = usedGroups[typeOfCost][group]
+                else:
+                    continue
+
+    return dicoVariants
+
 def result(address:str)->dict:
     """Executes the necesary steps to launch ChangeGroupCostByEpsilon
     @Param address : address of the VariantSet.csv and fort.json and out files
@@ -470,7 +620,8 @@ def result(address:str)->dict:
     with open(fort_address) as fort_file:
         fort_dict = json.load(fort_file)
     
-    result = ChangeHRGroupConsoCostsByEpsilon(test_folder, dicoVariants, fort_dict)
+    dicoVariants = ChangeHRGroupConsoCostsByEpsilon(test_folder, dicoVariants, fort_dict)
+    result = ChangeARGroupConsoCostsByEpsilon(test_folder, dicoVariants, fort_dict)
 
     return result
 
