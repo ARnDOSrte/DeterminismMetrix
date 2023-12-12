@@ -595,6 +595,139 @@ def ChangeARGroupConsoCostsByEpsilon(test_folder:str, dicoVariants:dict,dataJSON
 
     return dicoVariants
 
+def changeARTDHVDCCostsByEpsilon(test_folder:str, dicoVariants:dict,dataJSON:dict):
+    """Subtracts an epsilon to the AR preventive costs of the TD and HVDC, so as to favor the actions that are used in the preventive phase of the solution,
+    with priority to the groups that used to their maximum capacity, and then to the ones with the biggest power modification.
+    @Param test_folder : address of the folder containing the out files, the VariantSet.csv and fort.json
+    @Param dicoVariants : dict containing all the data of the VariantSet.csv
+    @Param dataJSON : dict containing all the data of the fort.json
+    @Return dicoVariants : modified dict in which the AR costs of the TDs and HVDCs are modified by an epsilon"""
+    
+    if test_folder[-1] == "/":
+        end_line = ""
+    else:
+        end_line = "/"
+
+    for variant_number in dicoVariants:
+    # for variant_number in range(-1,7):
+        print('Traitement TD/HVDC préventif : Variante ',variant_number)
+        #We import the VariantSet.csv and check that it has any redispatching going on
+        variant_address = test_folder + end_line + "out_s" + str(variant_number)
+        if not os.path.exists(variant_address):
+            continue
+
+        #We check that the simulation worked correctly and has info to show
+        df_variant_C1 = read_RX(variant_address, "C1")
+        if not df_variant_C1.empty:
+            if df_variant_C1["CODE"][0] != "0":
+                print("Le fichier de la variante ",variant_number," est vide. On passe aux variantes suivantes.")
+                continue
+    
+        #FOR THE HVDC : 
+        df_variant_R6 = read_RX(variant_address, "R6")
+        used_HVDC = []
+        if not df_variant_R6.empty:
+            
+            dicoHVDCNames = extractDataJSON.getIndiceElement(dataJSON, "DCNOMQUA")
+            listHVDCPower = extractDataJSON.searchForData(dataJSON, "DCIMPPUI")
+            listMaxHVDCPower = extractDataJSON.searchForData(dataJSON, "DCMAXPUI")
+            listMinHVDCPower = extractDataJSON.searchForData(dataJSON, "DCMINPUI")
+            for idx in df_variant_R6.index:
+                HVDCName = df_variant_R6["NOM"][idx]
+                actualPower = Decimal(df_variant_R6["TRANSIT"][idx])
+                initialPower = Decimal(listHVDCPower[dicoHVDCNames[HVDCName]])
+                maxPower = Decimal(listMaxHVDCPower[dicoHVDCNames[HVDCName]])
+                minPower = Decimal(listMinHVDCPower[dicoHVDCNames[HVDCName]])
+                if variant_number in dicoVariants and "DCIMPPUI" in dicoVariants[variant_number] and HVDCName in dicoVariants[variant_number]["DCIMPPUI"]:
+                    initialPower = Decimal(dicoVariants[variant_number]["DCIMPPUI"][HVDCName])
+                if variant_number in dicoVariants and "DCMAXPUI" in dicoVariants[variant_number] and HVDCName in dicoVariants[variant_number]["DCMAXPUI"]:
+                    maxPower = Decimal(dicoVariants[variant_number]["DCMAXPUI"][HVDCName])
+                if variant_number in dicoVariants and "DCMINPUI" in dicoVariants[variant_number] and HVDCName in dicoVariants[variant_number]["DCMINPUI"]:
+                    minPower = Decimal(dicoVariants[variant_number]["DCMINPUI"][HVDCName])
+                
+                HVDCVariation = abs(initialPower - actualPower)
+                maxedHVDC = True if (actualPower == maxPower or actualPower == minPower) else False
+                used_HVDC.append((HVDCName, HVDCVariation, maxedHVDC))
+            used_HVDC.sort(key=lambda item: (item[2],item[1]))
+        
+        HVDCCost = 0
+        if used_HVDC:
+            try:
+                HVDCCost = extractDataJSON.searchForData(dataJSON,'HVDCPENA')[0]
+            except:
+                HVDCCost = 0.1
+        added_cost = 0.0
+        former_HVDC_diff = 0.0
+        for HVDC in used_HVDC:
+            if former_HVDC_diff != HVDC[1]:
+                former_HVDC_diff = HVDC[1]
+                added_cost += float(epsilon)
+            if variant_number not in dicoVariants:
+                dicoVariants[variant_number] = {"COUTLCC":{HVDC[0] : Decimal("{:.{}f}".format(HVDCCost - added_cost,precision))}}
+            elif "COUTLCC" not in dicoVariants[variant_number]:
+                dicoVariants[variant_number]["COUTLCC"] = {HVDC[0] : Decimal("{:.{}f}".format(HVDCCost - added_cost,precision))}
+            elif HVDC[0] not in dicoVariants[variant_number]["COUTLCC"]:
+                dicoVariants[variant_number]["COUTLCC"][HVDC[0]] = Decimal("{:.{}f}".format(HVDCCost - added_cost,precision))
+            else:
+                raise Exception(f'{HVDC[0]} is already written under the COUTLCC section in the VariantSet.csv')
+        
+        #FOR THE TD :
+        df_variant_R5 = read_RX(variant_address, "R5")
+        used_TD = []
+        if not df_variant_R5.empty:
+            
+            listQuadNames = extractDataJSON.searchForData(dataJSON, "CQNOMQUA")
+            listTDNums = extractDataJSON.searchForData(dataJSON, "DTTRDEQU")
+            listInitialDephasage = extractDataJSON.searchForData(dataJSON, "DTVALDEP")
+            listMaxDephasage = extractDataJSON.searchForData(dataJSON, "DTVALSUP")
+            listMinDephasage = extractDataJSON.searchForData(dataJSON, "DTVALINF")
+            
+            #Getting and sorting the use of TDs
+            for idx in df_variant_R5.index:
+                
+                quadName = df_variant_R5["TD"][idx]
+                quadIndice = listQuadNames.index(quadName)
+                TDIndice = listTDNums.index(quadIndice + 1) #it seems the JSON files' list index starts with 1
+                actualDephasage = Decimal(df_variant_R5["CONSIGNE"][idx])
+                initialDephasage = Decimal(listInitialDephasage[TDIndice])
+                maxDephasage = listMaxDephasage[TDIndice]
+                minDephasage = listMinDephasage[TDIndice]
+                if variant_number in dicoVariants and "DTVALDEP" in dicoVariants[variant_number] and quadName in dicoVariants[variant_number]["DTVALDEP"]:
+                    initialDephasage = Decimal(dicoVariants[variant_number]["DTVALDEP"][quadName])
+                if variant_number in dicoVariants and "DTVALSUP" in dicoVariants[variant_number] and quadName in dicoVariants[variant_number]["DTVALSUP"]:
+                    maxDephasage = Decimal(dicoVariants[variant_number]["DTVALSUP"][quadName])
+                if variant_number in dicoVariants and "DTVALINF" in dicoVariants[variant_number] and quadName in dicoVariants[variant_number]["DTVALINF"]:
+                    minDephasage = Decimal(dicoVariants[variant_number]["DTVALINF"][quadName])
+                maxedTD = True if (actualDephasage == maxDephasage or actualDephasage == minDephasage) else False
+                dephasageVariation = abs(actualDephasage - initialDephasage)
+                used_TD.append((quadName, dephasageVariation, maxedTD))
+            
+            used_TD.sort(key=lambda item: (item[2], item[1]))
+
+        #Writing the new costs int the VariantSet.csv
+        TDCost = 0
+        if used_TD:
+            try:
+                TDCost = extractDataJSON.searchForData(dataJSON,'TDPENALI')[0]
+            except:
+                TDCost = 0.01
+        added_cost = 0.0
+        former_TD_diff = 0.0
+        for TD in used_TD:
+            if former_TD_diff != TD[1]:
+                added_cost += float(epsilon)
+                former_TD_diff = TD[1]
+            if variant_number not in dicoVariants:
+                dicoVariants[variant_number] = {"COUTTD":{TD[0] : Decimal("{:.{}f}".format(TDCost - TDCost - added_cost,precision))}}
+            elif "COUTTD" not in dicoVariants[variant_number]:
+                dicoVariants[variant_number]["COUTTD"] = {TD[0] : Decimal("{:.{}f}".format(TDCost - added_cost,precision))}
+            elif TD[0] not in dicoVariants[variant_number]["COUTTD"]:
+                dicoVariants[variant_number]["COUTTD"][TD[0]] = Decimal("{:.{}f}".format(TDCost - added_cost,precision))
+            else:
+                raise Exception(f'{TD[0]} is already written under the COUTTD section in the VariantSet.csv')
+
+    return dicoVariants
+
 def result(address:str)->dict:
     """Executes the necesary steps to launch ChangeGroupCostByEpsilon
     @Param address : address of the VariantSet.csv and fort.json and out files
@@ -621,7 +754,8 @@ def result(address:str)->dict:
         fort_dict = json.load(fort_file)
     
     dicoVariants = ChangeHRGroupConsoCostsByEpsilon(test_folder, dicoVariants, fort_dict)
-    result = ChangeARGroupConsoCostsByEpsilon(test_folder, dicoVariants, fort_dict)
+    dicoVariants = ChangeARGroupConsoCostsByEpsilon(test_folder, dicoVariants, fort_dict)
+    result = changeARTDHVDCCostsByEpsilon(test_folder, dicoVariants, fort_dict)
 
     return result
 
